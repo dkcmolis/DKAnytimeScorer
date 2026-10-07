@@ -574,7 +574,6 @@ def build_team_summary(raw_odds: pd.DataFrame, team_goal_rates: pd.DataFrame, ho
             row[f"{prefix} Team xG"] = team_xg
             row[f"{prefix} Scorer xG"] = scorer_xg
             row[f"{prefix} Gap"] = scorer_xg - team_xg if pd.notna(team_xg) else float("nan")
-        row["Team xG Diff (FD - DK)"] = row["FD Team xG"] - row["DK Team xG"]
         summary_rows.append(row)
     return pd.DataFrame(summary_rows)
 
@@ -640,9 +639,18 @@ automatic_refresh()
 
 ALL_GAMES = "__all_games__"
 PRICE_GAP_LIMIT = 20
-PRICE_GAP_COLUMNS = [
-    "Player", "Team", "Game", "DK Odds", "FD Odds",
-    "DK Implied %", "FD Implied %", "FD Difference",
+FD_PRICE_GAP_COLUMNS = [
+    "Player", "Team", "Game",
+    "DK Odds", "FD Odds",
+    "DK Implied %", "FD Implied %",
+    "FD Difference",
+]
+
+BET365_PRICE_GAP_COLUMNS = [
+    "Player", "Team", "Game",
+    "DK Odds", "Bet365 Odds",
+    "DK Implied %", "Bet365 Implied %",
+    "Bet365 Difference",
 ]
 
 
@@ -719,7 +727,7 @@ def display_game(
         team_summary = build_team_summary(matched_odds, team_goal_rates, home_team, away_team)
         styled_summary = (
             team_summary.style
-            .map(sign_color, subset=["DK Gap", "FD Gap", "Bet365 Gap", "Team xG Diff (FD - DK)"])
+            .map(sign_color, subset=["DK Gap", "FD Gap", "Bet365 Gap"])
             .format(
                 {
                     "DK Team xG": "{:.2f}", "FD Team xG": "{:.2f}",
@@ -727,7 +735,6 @@ def display_game(
                     "Bet365 Team xG": "{:.2f}", "Bet365 Scorer xG": "{:.2f}",
                     "DK Gap": "{:+.2f}", "FD Gap": "{:+.2f}",
                     "Bet365 Gap": "{:+.2f}",
-                    "Team xG Diff (FD - DK)": "{:+.2f}",
                 }
             )
         )
@@ -857,24 +864,35 @@ def build_price_gaps(events: list):
         frames.append(comparison)
 
     if not frames:
-        return pd.DataFrame(columns=PRICE_GAP_COLUMNS), failed_games
+        return pd.DataFrame(columns=FD_PRICE_GAP_COLUMNS + BET365_PRICE_GAP_COLUMNS), failed_games
 
     # Only players priced at both books can have a DK-vs-FD gap.
-    gaps = pd.concat(frames, ignore_index=True).dropna(subset=["DK Implied %", "FD Implied %"])
-    return gaps[PRICE_GAP_COLUMNS], failed_games
+    gaps = pd.concat(frames, ignore_index=True)
+    return gaps, failed_games
 
 
-def display_price_gap_table(gaps: pd.DataFrame):
+def display_price_gap_table(gaps: pd.DataFrame, book: str):
+    if book == "FD":
+        columns = FD_PRICE_GAP_COLUMNS
+        difference_column = "FD Difference"
+        formats = {
+            "DK Implied %": "{:.2f}%",
+            "FD Implied %": "{:.2f}%",
+            "FD Difference": "{:+.2f}%",
+        }
+    else:
+        columns = BET365_PRICE_GAP_COLUMNS
+        difference_column = "Bet365 Difference"
+        formats = {
+            "DK Implied %": "{:.2f}%",
+            "Bet365 Implied %": "{:.2f}%",
+            "Bet365 Difference": "{:+.2f}%",
+        }
+
     styled_gaps = (
-        gaps.style
-        .map(sign_color, subset=["FD Difference"])
-        .format(
-            {
-                "DK Implied %": "{:.2f}%",
-                "FD Implied %": "{:.2f}%",
-                "FD Difference": "{:+.2f}%",
-            }
-        )
+        gaps[columns].style
+        .map(sign_color, subset=[difference_column])
+        .format(formats)
     )
     st.dataframe(styled_gaps, use_container_width=True, hide_index=True)
 
@@ -898,21 +916,49 @@ def render_price_gaps(slates: dict):
         f"Retrieved at {datetime.now(PACIFIC_TIME).strftime('%I:%M:%S %p PT')}"
     )
 
-    # FD - DK > 0 means FanDuel implies a higher probability, i.e. DK is the longer price.
-    dk_longer = gaps.loc[gaps["FD Difference"] > 0].nlargest(PRICE_GAP_LIMIT, "FD Difference")
-    dk_shorter = gaps.loc[gaps["FD Difference"] < 0].nsmallest(PRICE_GAP_LIMIT, "FD Difference")
+    # Positive difference means the comparison book is shorter than DK,
+    # so DK has the longer price.
+    fd_gaps = gaps.dropna(subset=["DK Implied %", "FD Implied %"])
+    bet365_gaps = gaps.dropna(subset=["DK Implied %", "Bet365 Implied %"])
+
+    fd_dk_longer = fd_gaps.loc[fd_gaps["FD Difference"] > 0].nlargest(
+        PRICE_GAP_LIMIT, "FD Difference"
+    )
+    fd_dk_shorter = fd_gaps.loc[fd_gaps["FD Difference"] < 0].nsmallest(
+        PRICE_GAP_LIMIT, "FD Difference"
+    )
+
+    bet365_dk_longer = bet365_gaps.loc[
+        bet365_gaps["Bet365 Difference"] > 0
+        ].nlargest(PRICE_GAP_LIMIT, "Bet365 Difference")
+
+    bet365_dk_shorter = bet365_gaps.loc[
+        bet365_gaps["Bet365 Difference"] < 0
+        ].nsmallest(PRICE_GAP_LIMIT, "Bet365 Difference")
 
     st.markdown(f"#### DK Priced Longer Than FD (Top {PRICE_GAP_LIMIT})")
-    if dk_longer.empty:
+    if fd_dk_longer.empty:
         st.info("No players where DraftKings is longer than FanDuel.")
     else:
-        display_price_gap_table(dk_longer)
+        display_price_gap_table(fd_dk_longer, "FD")
 
     st.markdown(f"#### DK Priced Shorter Than FD (Top {PRICE_GAP_LIMIT})")
-    if dk_shorter.empty:
+    if fd_dk_shorter.empty:
         st.info("No players where DraftKings is shorter than FanDuel.")
     else:
-        display_price_gap_table(dk_shorter)
+        display_price_gap_table(fd_dk_shorter, "FD")
+
+    st.markdown(f"#### DK Priced Longer Than Bet365 (Top {PRICE_GAP_LIMIT})")
+    if bet365_dk_longer.empty:
+        st.info("No players where DraftKings is longer than Bet365.")
+    else:
+        display_price_gap_table(bet365_dk_longer, "Bet365")
+
+    st.markdown(f"#### DK Priced Shorter Than Bet365 (Top {PRICE_GAP_LIMIT})")
+    if bet365_dk_shorter.empty:
+        st.info("No players where DraftKings is shorter than Bet365.")
+    else:
+        display_price_gap_table(bet365_dk_shorter, "Bet365")
 
 
 try:

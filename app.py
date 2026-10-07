@@ -7,12 +7,16 @@ import pandas as pd
 import requests
 import streamlit as st
 
-API_BASE_URL = "https://api.the-odds-api.com/v4"
+OPTICODDS_API_BASE_URL = "https://api.opticodds.com/api/v3"
 NHL_API_BASE_URL = "https://api-web.nhle.com/v1"
 PACIFIC_TIME = ZoneInfo("America/Los_Angeles")
 
-TARGET_BOOKS = {"draftkings", "fanduel"}
-BOOK_LABELS = {"draftkings": "DraftKings", "fanduel": "FanDuel"}
+TARGET_BOOKS = {"draftkings", "fanduel", "bet365"}
+BOOK_LABELS = {
+    "draftkings": "DraftKings",
+    "fanduel": "FanDuel",
+    "bet365": "Bet365",
+}
 
 TEAM_CODES = {
     "Anaheim Ducks": "ANA", "Boston Bruins": "BOS", "Buffalo Sabres": "BUF",
@@ -39,6 +43,7 @@ PLAYER_NAME_ALIASES = {
     "charles-alexis legault": "charles alexis legault",
     "charlesalexis legault": "charles alexis legault",
     "alex wennberg": "alexander wennberg",
+    "nicholas robertson": "nick robertson",
 }
 
 
@@ -91,29 +96,87 @@ def sign_color(value):
 @st.cache_data(ttl=60, show_spinner=False)
 def get_nhl_events(api_key: str):
     response = requests.get(
-        f"{API_BASE_URL}/sports/icehockey_nhl/events",
-        params={"apiKey": api_key},
+        f"{OPTICODDS_API_BASE_URL}/fixtures/active",
+        headers={"X-Api-Key": api_key},
+        params={"league": "nhl"},
         timeout=20,
     )
     response.raise_for_status()
-    return response.json()
+    events = []
+    for fixture in response.json().get("data", []):
+        home_teams = fixture.get("home_competitors", [])
+        away_teams = fixture.get("away_competitors", [])
+        if not home_teams or not away_teams:
+            continue
+        events.append(
+            {
+                "id": fixture["id"],
+                "commence_time": fixture["start_date"],
+                "home_team": home_teams[0]["name"],
+                "away_team": away_teams[0]["name"],
+            }
+        )
+    return events
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def find_opticodds_rows(value):
+    rows = []
+    if isinstance(value, dict):
+        if "sportsbook" in value and "price" in value and "market" in value:
+            rows.append(value)
+        for child in value.values():
+            rows.extend(find_opticodds_rows(child))
+    elif isinstance(value, list):
+        for child in value:
+            rows.extend(find_opticodds_rows(child))
+    return rows
+
+
+def find_opticodds_fixture(value):
+    if isinstance(value, dict):
+        if "home_competitors" in value and "away_competitors" in value:
+            return value
+        for child in value.values():
+            fixture = find_opticodds_fixture(child)
+            if fixture is not None:
+                return fixture
+    elif isinstance(value, list):
+        for child in value:
+            fixture = find_opticodds_fixture(child)
+            if fixture is not None:
+                return fixture
+    return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def get_anytime_goal_odds(api_key: str, event_id: str):
+    params = [
+        ("fixture_id", event_id),
+        ("sportsbook", "draftkings"),
+        ("sportsbook", "fanduel"),
+        ("sportsbook", "bet365"),
+        ("market", "Anytime Goal Scorer"),
+        ("market", "Team Total"),
+        ("odds_format", "AMERICAN"),
+    ]
     response = requests.get(
-        f"{API_BASE_URL}/sports/icehockey_nhl/events/{event_id}/odds",
-        params={
-            "apiKey": api_key,
-            "regions": "us",
-            "bookmakers": "draftkings,fanduel",
-            "markets": "player_goal_scorer_anytime,alternate_team_totals",
-            "oddsFormat": "american",
-        },
+        f"{OPTICODDS_API_BASE_URL}/fixtures/odds",
+        headers={"X-Api-Key": api_key},
+        params=params,
         timeout=20,
     )
     response.raise_for_status()
-    return response.json(), response.headers
+    response_json = response.json()
+    fixture = find_opticodds_fixture(response_json.get("data", response_json))
+    if fixture is None:
+        raise requests.exceptions.RequestException("Fixture details were not returned by OpticOdds.")
+    home_teams = fixture.get("home_competitors", [])
+    away_teams = fixture.get("away_competitors", [])
+    return {
+        "home_team": home_teams[0]["name"],
+        "away_team": away_teams[0]["name"],
+        "odds": find_opticodds_rows(response_json.get("data", response_json)),
+    }, response.headers
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -142,53 +205,45 @@ def build_player_team_map(home_team: str, away_team: str):
 
 def normalize_odds(odds_payload: dict, player_team_map: dict) -> pd.DataFrame:
     rows = []
-    for bookmaker in odds_payload.get("bookmakers", []):
-        book_key = bookmaker.get("key")
+    goal_rows = [
+        odd for odd in odds_payload.get("odds", [])
+        if odd.get("market") == "Anytime Goal Scorer"
+    ]
+    for book_key in TARGET_BOOKS:
+        book_odds = [odd for odd in goal_rows if odd.get("sportsbook", "").lower() == book_key]
         if book_key not in TARGET_BOOKS:
             continue
-        for market in bookmaker.get("markets", []):
-            if market.get("key") != "player_goal_scorer_anytime":
+        pettersson_odds = [
+            odd for odd in book_odds
+            if normalize_name(odd.get("name") or odd.get("selection") or "") == "elias pettersson"
+        ]
+        pettersson_rank = {
+            id(odd): rank
+            for rank, odd in enumerate(
+                sorted(
+                    pettersson_odds,
+                    key=lambda item: american_to_implied_probability(item["price"]),
+                    reverse=True,
+                )
+            )
+        }
+        for odd in book_odds:
+            if odd.get("price") is None:
                 continue
-            yes_outcomes = [
-                outcome for outcome in market.get("outcomes", [])
-                if outcome.get("name") == "Yes" and outcome.get("price") is not None
-            ]
-            pettersson_outcomes = [
-                outcome for outcome in yes_outcomes
-                if normalize_name(outcome.get("description", "")) == "elias pettersson"
-            ]
-            pettersson_rank = {
-                id(outcome): rank
-                for rank, outcome in enumerate(
-                    sorted(
-                        pettersson_outcomes,
-                        key=lambda item: american_to_implied_probability(item["price"]),
-                        reverse=True,
-                    )
-                )
-            }
-            for outcome in yes_outcomes:
-                raw_player_name = outcome.get("description", "Unknown player")
-                player_name = raw_player_name
-                if (
-                    normalize_name(raw_player_name) == "elias pettersson"
-                    and len(pettersson_outcomes) > 1
-                ):
-                    player_name = (
-                        "Elias Pettersson (F)"
-                        if pettersson_rank[id(outcome)] == 0
-                        else "Elias Pettersson (D)"
-                    )
-                odds = outcome["price"]
-                rows.append(
-                    {
-                        "Player": player_name,
-                        "Team": player_team_map.get(normalize_name(raw_player_name), "Unmatched"),
-                        "Book Key": book_key,
-                        "American Odds": odds,
-                        "Implied Probability": american_to_implied_probability(odds),
-                    }
-                )
+            raw_player_name = odd.get("name") or odd.get("selection") or "Unknown player"
+            player_name = raw_player_name
+            if normalize_name(raw_player_name) == "elias pettersson" and len(pettersson_odds) > 1:
+                player_name = "Elias Pettersson (F)" if pettersson_rank[id(odd)] == 0 else "Elias Pettersson (D)"
+            odds = odd["price"]
+            rows.append(
+                {
+                    "Player": player_name,
+                    "Team": player_team_map.get(normalize_name(raw_player_name), "Unmatched"),
+                    "Book Key": book_key,
+                    "American Odds": odds,
+                    "Implied Probability": american_to_implied_probability(odds),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -205,37 +260,37 @@ def outcome_team(outcome: dict, home_team: str, away_team: str):
 def extract_team_totals(odds_payload: dict, home_team: str, away_team: str) -> pd.DataFrame:
     rows = []
 
-    for bookmaker in odds_payload.get("bookmakers", []):
-        book_key = bookmaker.get("key")
-        if book_key not in TARGET_BOOKS:
+    for odd in odds_payload.get("odds", []):
+        book_key = odd.get("sportsbook", "").lower()
+        if book_key not in TARGET_BOOKS or odd.get("market") != "Team Total":
             continue
 
-        for market in bookmaker.get("markets", []):
-            market_key = market.get("key")
+        side = str(odd.get("selection_line", "")).title()
+        price = odd.get("price")
+        point = odd.get("points")
+        text = f"{odd.get('name', '')} {odd.get('selection', '')}"
+        team = next(
+            (
+                candidate for candidate in [home_team, away_team]
+                if normalize_name(candidate) in normalize_name(text)
+            ),
+            None,
+        )
 
-            if market_key not in {"team_totals", "alternate_team_totals"}:
-                continue
+        if side not in {"Over", "Under"} or price is None or point is None or team is None:
+            continue
 
-            for outcome in market.get("outcomes", []):
-                side = outcome.get("name")
-                price = outcome.get("price")
-                point = outcome.get("point")
-                team = outcome_team(outcome, home_team, away_team)
-
-                if side not in {"Over", "Under"} or price is None or point is None or team is None:
-                    continue
-
-                rows.append(
-                    {
-                        "Team": team,
-                        "Book Key": book_key,
-                        "Market Key": market_key,
-                        "Side": side,
-                        "Line": float(point),
-                        "American Odds": price,
-                        "Raw Probability": american_to_implied_probability(price) / 100,
-                    }
-                )
+        rows.append(
+            {
+                "Team": team,
+                "Book Key": book_key,
+                "Market Key": "team_totals" if odd.get("is_main") else "alternate_team_totals",
+                "Side": side,
+                "Line": float(point),
+                "American Odds": price,
+                "Raw Probability": american_to_implied_probability(price) / 100,
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -374,10 +429,9 @@ def build_team_total_implied_goals(team_totals: pd.DataFrame) -> pd.DataFrame:
 
     rates = pd.DataFrame(rows)
 
-    # Prefer alternate team totals: they are the detailed board that gives us
-    # the closest balanced line, with team_totals as a fallback.
+    # OpticOdds marks the sportsbook's balanced line as the main team total.
     rates["source_priority"] = rates["Market Key"].ne(
-        "alternate_team_totals"
+        "team_totals"
     ).astype(int)
 
     rates["balance_distance"] = (
@@ -442,14 +496,28 @@ def build_player_comparison(raw_odds: pd.DataFrame) -> pd.DataFrame:
             "Player": pivot.index,
             "DK Odds": get_column("American Odds", "draftkings"),
             "FD Odds": get_column("American Odds", "fanduel"),
+            "Bet365 Odds": get_column("American Odds", "bet365"),
             "DK Implied %": get_column("Implied Probability", "draftkings"),
             "FD Implied %": get_column("Implied Probability", "fanduel"),
+            "Bet365 Implied %": get_column("Implied Probability", "bet365"),
             "DK xG": get_column("Player Implied Goals", "draftkings"),
             "FD xG": get_column("Player Implied Goals", "fanduel"),
+            "Bet365 xG": get_column("Player Implied Goals", "bet365"),
         }
     ).reset_index(drop=True)
-    comparison["Difference (FD - DK)"] = comparison["FD Implied %"] - comparison["DK Implied %"]
+    comparison["FD Difference"] = comparison["FD Implied %"] - comparison["DK Implied %"]
     comparison["xG Diff (FD - DK)"] = comparison["FD xG"] - comparison["DK xG"]
+    comparison["Bet365 Difference"] = (
+            comparison["Bet365 Implied %"] - comparison["DK Implied %"]
+    )
+
+    comparison["xG Diff (Bet365 - DK)"] = (
+            comparison["Bet365 xG"] - comparison["DK xG"]
+    )
+
+    comparison["Best Price"] = comparison[
+        ["DK Odds", "FD Odds", "Bet365 Odds"]
+    ].max(axis=1)
 
     def best_book(row):
         prices = []
@@ -457,14 +525,35 @@ def build_player_comparison(raw_odds: pd.DataFrame) -> pd.DataFrame:
             prices.append(("DraftKings", row["DK Implied %"]))
         if pd.notna(row["FD Implied %"]):
             prices.append(("FanDuel", row["FD Implied %"]))
+        if pd.notna(row["Bet365 Implied %"]):
+            prices.append(("Bet365", row["Bet365 Implied %"]))
         return min(prices, key=lambda item: item[1])[0] if prices else "—"
 
     comparison["Best Price"] = comparison.apply(best_book, axis=1)
-    comparison["Best Implied %"] = comparison[["DK Implied %", "FD Implied %"]].min(axis=1)
+    comparison["Best Implied %"] = comparison[["DK Implied %", "FD Implied %", "Bet365 Implied %"]].min(axis=1)
     comparison = comparison.sort_values(["Best Implied %", "Player"], ascending=[False, True])
     comparison["DK Odds"] = comparison["DK Odds"].apply(format_american_odds)
     comparison["FD Odds"] = comparison["FD Odds"].apply(format_american_odds)
-    return comparison.drop(columns="Best Implied %")
+    comparison["Bet365 Odds"] = comparison["Bet365 Odds"].apply(format_american_odds)
+    return comparison[
+        [
+            "Player",
+            "DK Odds",
+            "FD Odds",
+            "Bet365 Odds",
+            "FD Difference",
+            "Bet365 Difference",
+            "DK Implied %",
+            "FD Implied %",
+            "Bet365 Implied %",
+            "DK xG",
+            "FD xG",
+            "Bet365 xG",
+            "xG Diff (FD - DK)",
+            "xG Diff (Bet365 - DK)",
+            "Best Price",
+        ]
+    ]
 
 
 def build_team_summary(raw_odds: pd.DataFrame, team_goal_rates: pd.DataFrame, home_team: str, away_team: str):
@@ -476,7 +565,7 @@ def build_team_summary(raw_odds: pd.DataFrame, team_goal_rates: pd.DataFrame, ho
     summary_rows = []
     for team, side in [(home_team, "H"), (away_team, "A")]:
         row = {"Team": f"{team} ({side})"}
-        for book_key, prefix in [("draftkings", "DK"), ("fanduel", "FD")]:
+        for book_key, prefix in [("draftkings", "DK"), ("fanduel", "FD"), ("bet365", "Bet365")]:
             book_odds = raw_odds.loc[(raw_odds["Team"] == team) & (raw_odds["Book Key"] == book_key)]
             rate_data = rate_lookup.get((team, book_key), {})
             team_xg = rate_data.get("Market Implied Goals", float("nan"))
@@ -498,39 +587,50 @@ def display_player_section(team_name: str, side: str, team_odds: pd.DataFrame):
     comparison = build_player_comparison(team_odds)
     styled_comparison = (
         comparison.style
-        .map(sign_color, subset=["Difference (FD - DK)", "xG Diff (FD - DK)"])
+        .map(sign_color, subset=[
+            "FD Difference",
+            "Bet365 Difference",
+            "xG Diff (FD - DK)",
+            "xG Diff (Bet365 - DK)",
+        ])
+
         .format(
             {
                 "DK Implied %": "{:.2f}%",
                 "FD Implied %": "{:.2f}%",
-                "Difference (FD - DK)": "{:+.2f}%",
+                "Bet365 Implied %": "{:.2f}%",
+                "FD Difference": "{:+.2f}%",
+                "Bet365 Difference": "{:+.2f}%",
                 "DK xG": "{:.3f}",
                 "FD xG": "{:.3f}",
+                "Bet365 xG": "{:.3f}",
                 "xG Diff (FD - DK)": "{:+.3f}",
+                "xG Diff (Bet365 - DK)": "{:+.3f}",
             }
         )
     )
+
     st.dataframe(styled_comparison, use_container_width=True, hide_index=True)
 
 
 st.set_page_config(page_title="NHL Anytime Goal Comparison", layout="wide")
 st.title("NHL Anytime Goal Comparison")
-st.caption("DraftKings vs FanDuel • Anytime Goal Scorer • Market-Implied Goals")
+st.caption("DraftKings vs FanDuel vs Bet365 • Anytime Goal Scorer • Market-Implied Goals")
 
 try:
-    api_key = st.secrets["odds_api"]["api_key"].strip()
+    api_key = st.secrets["opticodds"]["api_key"].strip()
 except KeyError:
-    st.error("API key not found in `.streamlit/secrets.toml`.")
+    st.error("OpticOdds API key not found in `.streamlit/secrets.toml`.")
     st.stop()
 
 if "last_auto_refresh" not in st.session_state:
     st.session_state.last_auto_refresh = datetime.now(PACIFIC_TIME)
 
 
-@st.fragment(run_every=300)
+@st.fragment(run_every=60)
 def automatic_refresh():
     elapsed = datetime.now(PACIFIC_TIME) - st.session_state.last_auto_refresh
-    if elapsed >= timedelta(seconds=300):
+    if elapsed >= timedelta(seconds=60):
         st.session_state.last_auto_refresh = datetime.now(PACIFIC_TIME)
         st.rerun()
 
@@ -542,7 +642,7 @@ ALL_GAMES = "__all_games__"
 PRICE_GAP_LIMIT = 20
 PRICE_GAP_COLUMNS = [
     "Player", "Team", "Game", "DK Odds", "FD Odds",
-    "DK Implied %", "FD Implied %", "Difference (FD - DK)",
+    "DK Implied %", "FD Implied %", "FD Difference",
 ]
 
 
@@ -558,6 +658,7 @@ def load_game_odds(event_id: str):
     home_team = odds_payload["home_team"]
     away_team = odds_payload["away_team"]
     player_team_map = build_player_team_map(home_team, away_team)
+
 
     raw_odds = normalize_odds(odds_payload, player_team_map)
     if raw_odds.empty:
@@ -590,7 +691,7 @@ def display_game(
         home_team, away_team, raw_odds, team_goal_rates = game_data
 
     if raw_odds.empty:
-        st.warning(f"No DraftKings or FanDuel Anytime Goal Scorer odds were returned for {away_team} @ {home_team}.")
+        st.warning(f"No DraftKings, FanDuel, or Bet365 Anytime Goal Scorer odds were returned for {away_team} @ {home_team}.")
         return False
 
     matched_odds = raw_odds.loc[raw_odds["Team"] != "Unmatched"].copy()
@@ -607,29 +708,32 @@ def display_game(
     st.subheader(f"{away_team} @ {home_team}")
     display_time = retrieved_at or datetime.now(PACIFIC_TIME)
     st.caption(f"Retrieved at {display_time.strftime('%I:%M:%S %p PT')}")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Players", matched_odds["Player"].nunique())
     col2.metric("DraftKings Prices", matched_odds.loc[matched_odds["Book Key"] == "draftkings", "Player"].nunique())
     col3.metric("FanDuel Prices", matched_odds.loc[matched_odds["Book Key"] == "fanduel", "Player"].nunique())
+    col4.metric("Bet365 Prices", matched_odds.loc[matched_odds["Book Key"] == "bet365", "Player"].nunique())
 
     if not search_text:
         st.markdown("#### TEAM IMPLIED GOALS")
         team_summary = build_team_summary(matched_odds, team_goal_rates, home_team, away_team)
         styled_summary = (
             team_summary.style
-            .map(sign_color, subset=["DK Gap", "FD Gap", "Team xG Diff (FD - DK)"])
+            .map(sign_color, subset=["DK Gap", "FD Gap", "Bet365 Gap", "Team xG Diff (FD - DK)"])
             .format(
                 {
                     "DK Team xG": "{:.2f}", "FD Team xG": "{:.2f}",
                     "DK Scorer xG": "{:.2f}", "FD Scorer xG": "{:.2f}",
+                    "Bet365 Team xG": "{:.2f}", "Bet365 Scorer xG": "{:.2f}",
                     "DK Gap": "{:+.2f}", "FD Gap": "{:+.2f}",
+                    "Bet365 Gap": "{:+.2f}",
                     "Team xG Diff (FD - DK)": "{:+.2f}",
                 }
             )
         )
         st.dataframe(styled_summary, use_container_width=True, hide_index=True)
         if team_goal_rates.empty:
-            st.info("DK and FD did not return full-game team totals for this matchup. Player xG is shown from anytime scorer prices only.")
+            st.info("The books did not return full-game team totals for this matchup. Player xG is shown from anytime scorer prices only.")
         else:
             st.caption("Team xG is no-vig implied from the half-goal team total. Scorer xG comes from the anytime scorer board. Player xG is calibrated to Team xG when a team total is available.")
     else:
@@ -647,6 +751,7 @@ def display_game(
         if len(unmatched_players) > 0:
             st.warning(f"{len(unmatched_players)} player(s) could not be roster-matched: {', '.join(unmatched_players)}")
     return True
+
 
 
 def render_slate(events: list, selector_label: str, key_prefix: str, slate_name: str):
@@ -762,12 +867,12 @@ def build_price_gaps(events: list):
 def display_price_gap_table(gaps: pd.DataFrame):
     styled_gaps = (
         gaps.style
-        .map(sign_color, subset=["Difference (FD - DK)"])
+        .map(sign_color, subset=["FD Difference"])
         .format(
             {
                 "DK Implied %": "{:.2f}%",
                 "FD Implied %": "{:.2f}%",
-                "Difference (FD - DK)": "{:+.2f}%",
+                "FD Difference": "{:+.2f}%",
             }
         )
     )
@@ -794,8 +899,8 @@ def render_price_gaps(slates: dict):
     )
 
     # FD - DK > 0 means FanDuel implies a higher probability, i.e. DK is the longer price.
-    dk_longer = gaps.loc[gaps["Difference (FD - DK)"] > 0].nlargest(PRICE_GAP_LIMIT, "Difference (FD - DK)")
-    dk_shorter = gaps.loc[gaps["Difference (FD - DK)"] < 0].nsmallest(PRICE_GAP_LIMIT, "Difference (FD - DK)")
+    dk_longer = gaps.loc[gaps["FD Difference"] > 0].nlargest(PRICE_GAP_LIMIT, "FD Difference")
+    dk_shorter = gaps.loc[gaps["FD Difference"] < 0].nsmallest(PRICE_GAP_LIMIT, "FD Difference")
 
     st.markdown(f"#### DK Priced Longer Than FD (Top {PRICE_GAP_LIMIT})")
     if dk_longer.empty:
